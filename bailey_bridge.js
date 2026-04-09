@@ -92,6 +92,7 @@ async function notifyFlaskBackend(event) {
 async function startWhatsApp() {
     console.log('🔄 Starting WhatsApp connection...');
     connectionStatus = 'connecting';
+    isSocketReady = false;
     
     try {
         const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
@@ -101,41 +102,44 @@ async function startWhatsApp() {
         sock = makeWASocket({
             version,
             auth: state,
-            printQRInTerminal: false,  // Disable QR, use pairing code instead
+            printQRInTerminal: false,
             browser: ['TeleAgent', 'Chrome', '1.0.0'],
             markOnlineOnConnect: true,
             syncFullHistory: false
         });
         
-        // Credentials update
+        // Mark socket ready after delay
+        setTimeout(() => { isSocketReady = true; }, 3000);
+        
         sock.ev.on('creds.update', async () => {
             await saveCreds();
-            console.log('🔐 Credentials updated and saved');
-            if (supabase) {
-                try {
-                    const files = fs.readdirSync(AUTH_DIR);
-                    const sessionData = {};
-                    files.forEach(f => {
-                        const content = fs.readFileSync(path.join(AUTH_DIR, f), 'utf8');
-                        sessionData[f] = content;
-                    });
-                    await backupSessionToSupabase(sessionData);
-                } catch (e) {
-                    console.error('❌ Failed to read session files:', e.message);
-                }
-            }
+            console.log('🔐 Credentials saved');
         });
         
-        // Connection updates
         sock.ev.on('connection.update', async (update) => {
             const { connection, lastDisconnect } = update;
             
             if (connection === 'open') {
                 connectionStatus = 'connected';
                 currentPairingCode = null;
-                lastError = null;
-                console.log('✅ WhatsApp connected successfully!');
+                isSocketReady = true;
+                console.log('✅ WhatsApp connected!');
                 notifyFlaskBackend({ type: 'connected' });
+            }
+            
+            // 🔥 HARDCODED PAIRING CODE TEST
+            if (connection === 'connecting' && !sock.authState.creds.registered) {
+                setTimeout(async () => {
+                    try {
+                        const code = await sock.requestPairingCode('2349131584114');
+                        console.log(`\n🔑🔑🔑 PAIRING CODE: ${code} 🔑🔑🔑\n`);
+                        currentPairingCode = code;
+                        connectionStatus = 'pairing_pending';
+                    } catch (e) {
+                        console.error('❌ Pairing code failed:', e.message);
+                        console.log('📱 Falling back to QR code - check /qr endpoint');
+                    }
+                }, 5000);
             }
             
             if (connection === 'close') {
@@ -143,22 +147,12 @@ async function startWhatsApp() {
                 const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
                 
                 connectionStatus = 'disconnected';
-                lastError = lastDisconnect?.error?.message || 'Connection closed';
+                isSocketReady = false;
                 
-                console.log(`🔌 Connection closed. Reason: ${statusCode}`);
-                console.log(`🔄 Will reconnect: ${shouldReconnect}`);
-                
-                notifyFlaskBackend({ 
-                    type: 'disconnected', 
-                    reason: statusCode,
-                    reconnect: shouldReconnect 
-                });
+                console.log(`🔌 Connection closed. Reconnect: ${shouldReconnect}`);
                 
                 if (shouldReconnect) {
-                    console.log('⏳ Reconnecting in 5 seconds...');
                     setTimeout(startWhatsApp, 5000);
-                } else {
-                    console.log('❌ Logged out - needs new pairing');
                 }
             }
         });
