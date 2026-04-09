@@ -188,7 +188,6 @@ app.get('/', (req, res) => {
     });
 });
 
-// REQUEST PAIRING CODE - Initializes socket if needed
 app.post('/pair', async (req, res) => {
     const { phone_number } = req.body;
     
@@ -199,14 +198,95 @@ app.post('/pair', async (req, res) => {
     const cleanNumber = phone_number.replace(/\D/g, '');
     
     try {
-        // Initialize socket if not exists or disconnected
-        if (!sock || connectionStatus === 'disconnected') {
-            await initializeSocket();
+        // If socket exists but not connected, KILL IT and start fresh
+        if (sock && connectionStatus !== 'connected') {
+            console.log('🧹 Cleaning up stale socket...');
+            try { sock.end(); } catch(e) {}
+            sock = null;
+            connectionStatus = 'idle';
+            isSocketReady = false;
+            await new Promise(r => setTimeout(r, 1000));
+        }
+        
+        // Initialize fresh socket if needed
+        if (!sock) {
+            console.log('🔄 Creating new socket...');
+            
+            const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
+            const { version } = await fetchLatestBaileysVersion();
+            console.log(`📦 Baileys version: ${version}`);
+            
+            sock = makeWASocket({
+                version,
+                auth: state,
+                printQRInTerminal: false,
+                browser: ['TeleAgent', 'Chrome', '1.0.0'],
+                markOnlineOnConnect: false,
+                syncFullHistory: false
+            });
+            
+            // Mark ready after delay
+            setTimeout(() => { 
+                if (sock) {
+                    isSocketReady = true;
+                    console.log('✅ Socket ready for pairing');
+                }
+            }, 4000);
+            
+            sock.ev.on('creds.update', async () => {
+                await saveCreds();
+                console.log('🔐 Credentials saved');
+            });
+            
+            sock.ev.on('connection.update', (update) => {
+                const { connection } = update;
+                
+                if (connection === 'open') {
+                    connectionStatus = 'connected';
+                    isSocketReady = true;
+                    currentPairingCode = null;
+                    console.log('✅ WhatsApp connected!');
+                    notifyFlaskBackend({ type: 'connected' });
+                }
+                
+                if (connection === 'close') {
+                    console.log('🔌 Connection closed');
+                    connectionStatus = 'disconnected';
+                    isSocketReady = false;
+                    // Don't null sock here — let next /pair handle cleanup
+                }
+            });
+            
+            // Message handler
+            sock.ev.on('messages.upsert', async (m) => {
+                const message = m.messages[0];
+                if (!message.message || message.key.fromMe) return;
+                
+                const msgText = message.message.conversation || 
+                               message.message.extendedTextMessage?.text || '';
+                if (!msgText.trim()) return;
+                
+                const sender = message.key.remoteJid;
+                const senderNumber = sender.split('@')[0];
+                const senderName = message.pushName || 'Contact';
+                
+                console.log(`📨 WhatsApp from ${senderName}: ${msgText.substring(0, 50)}`);
+                
+                await notifyFlaskBackend({
+                    type: 'message',
+                    sender_number: senderNumber,
+                    sender_name: senderName,
+                    message_text: msgText,
+                    timestamp: new Date().toISOString()
+                });
+            });
+            
+            connectionStatus = 'connecting';
         }
         
         // Wait for socket to be ready
         let attempts = 0;
-        while (!isSocketReady && attempts < 20) {
+        while (!isSocketReady && attempts < 30) {
             await new Promise(r => setTimeout(r, 1000));
             attempts++;
         }
@@ -214,11 +294,11 @@ app.post('/pair', async (req, res) => {
         if (!isSocketReady) {
             return res.status(503).json({ 
                 success: false, 
-                error: 'Socket not ready. Please try again in a few seconds.' 
+                error: 'Socket initialization timeout. Please try again.' 
             });
         }
         
-        // Check if already connected
+        // Already connected?
         if (connectionStatus === 'connected') {
             return res.json({ 
                 success: true, 
@@ -228,7 +308,6 @@ app.post('/pair', async (req, res) => {
         }
         
         // Request pairing code
-        await new Promise(r => setTimeout(r, 1000));
         const code = await sock.requestPairingCode(cleanNumber);
         currentPairingCode = code;
         connectionStatus = 'pairing_pending';
@@ -239,26 +318,26 @@ app.post('/pair', async (req, res) => {
             success: true, 
             code: code,
             expires_in: 60,
-            message: 'Enter this code in WhatsApp: Settings → Linked Devices → Link a Device'
+            message: 'Enter this code in WhatsApp'
         });
-        
-        await notifyFlaskBackend({ type: 'pairing_code', phone: cleanNumber, code: code });
         
     } catch (error) {
         console.error('❌ Pairing error:', error.message);
         
-        if (error.message.includes('Connection Closed')) {
-            // Reset and retry
+        // On any error, clean up completely
+        if (sock) {
+            try { sock.end(); } catch(e) {}
             sock = null;
-            connectionStatus = 'idle';
-            isSocketReady = false;
-            return res.status(503).json({ 
-                success: false, 
-                error: 'Connection lost. Please try again.' 
-            });
         }
+        connectionStatus = 'idle';
+        isSocketReady = false;
         
-        res.status(500).json({ success: false, error: error.message });
+        res.status(500).json({ 
+            success: false, 
+            error: error.message.includes('408') 
+                ? 'Request timed out. Please try again.' 
+                : error.message 
+        });
     }
 });
 
