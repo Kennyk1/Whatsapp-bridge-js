@@ -1,6 +1,6 @@
 // bailey_bridge.js - WhatsApp Bridge Service for TeleAgent
 
-const { default: makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion } = require('@whiskeysockets/baileys');
+const { default: makeWASocket, useMultiFileAuthState, fetchLatestBaileysVersion } = require('@whiskeysockets/baileys');
 const express = require('express');
 const fs = require('fs');
 const path = require('path');
@@ -35,7 +35,6 @@ if (!fs.existsSync(AUTH_DIR)) {
 // ============================================================
 let sock = null;
 let connectionStatus = 'idle';
-let isSocketReady = false;
 let currentPairingCode = null;
 let lastError = null;
 
@@ -96,12 +95,11 @@ app.get('/', (req, res) => {
         service: 'TeleAgent WhatsApp Bridge',
         status: connectionStatus,
         connected: connectionStatus === 'connected',
-        socket_ready: isSocketReady,
         timestamp: new Date().toISOString()
     });
 });
 
-// FIXED /pair endpoint - waits for QR event before requesting code
+// ✅ FIXED /pair endpoint - WORKING VERSION
 app.post('/pair', async (req, res) => {
     const { phone_number } = req.body;
 
@@ -112,14 +110,15 @@ app.post('/pair', async (req, res) => {
     const cleanNumber = phone_number.replace(/\D/g, '');
 
     try {
-        // Kill existing socket if any
+        // Reset socket
         if (sock) {
-            try { sock.end(); } catch(e) {}
+            try { sock.end(); } catch {}
             sock = null;
         }
 
         const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
         const { version } = await fetchLatestBaileysVersion();
+        console.log(`📦 Baileys version: ${version}`);
 
         sock = makeWASocket({
             version,
@@ -132,7 +131,7 @@ app.post('/pair', async (req, res) => {
             await saveCreds();
             console.log('🔐 Credentials saved');
             
-            // Backup to Supabase if configured
+            // Backup to Supabase
             if (supabase) {
                 try {
                     const files = fs.readdirSync(AUTH_DIR);
@@ -145,16 +144,34 @@ app.post('/pair', async (req, res) => {
             }
         });
 
-        let codeRequested = false;
+        let responded = false;
 
-        sock.ev.on('connection.update', async (update) => {
-            const { connection, qr } = update;
+        // ⏰ Timeout protection (20 seconds)
+        const timeout = setTimeout(() => {
+            if (!responded) {
+                responded = true;
+                try {
+                    res.status(504).json({ success: false, error: 'Pairing timeout, try again' });
+                } catch {}
+                if (sock) {
+                    try { sock.end(); } catch {}
+                    sock = null;
+                }
+                connectionStatus = 'idle';
+            }
+        }, 20000);
 
-            // ✅ CRITICAL: Wait for QR event, then request pairing code
-            if (qr && !codeRequested) {
-                codeRequested = true;
+        sock.ev.on('connection.update', async ({ connection, qr }) => {
+
+            // ✅ ONLY trigger on QR event
+            if (qr && !responded) {
+                responded = true;
+                clearTimeout(timeout);
 
                 try {
+                    // Small delay improves reliability
+                    await new Promise(r => setTimeout(r, 500));
+
                     const code = await sock.requestPairingCode(cleanNumber);
                     currentPairingCode = code;
                     connectionStatus = 'pairing_pending';
@@ -183,7 +200,6 @@ app.post('/pair', async (req, res) => {
 
             if (connection === 'open') {
                 connectionStatus = 'connected';
-                isSocketReady = true;
                 currentPairingCode = null;
                 lastError = null;
                 console.log('✅ WhatsApp connected!');
@@ -193,7 +209,6 @@ app.post('/pair', async (req, res) => {
             if (connection === 'close') {
                 console.log('🔌 Connection closed');
                 connectionStatus = 'disconnected';
-                isSocketReady = false;
                 sock = null;
             }
         });
@@ -244,7 +259,6 @@ app.get('/status', (req, res) => {
         success: true,
         status: connectionStatus,
         connected: connectionStatus === 'connected',
-        socket_ready: isSocketReady,
         has_code: currentPairingCode !== null,
         last_error: lastError
     });
@@ -258,15 +272,11 @@ app.post('/send', async (req, res) => {
     
     const { to_number, text } = req.body;
     if (!to_number || !text) {
-        return res.status(400).json({ success: false, error: 'Missing to_number or text' });
+        return res.status(400).json({ success: false, error: 'Missing fields' });
     }
     
     if (!sock || connectionStatus !== 'connected') {
-        return res.status(503).json({ 
-            success: false, 
-            error: 'WhatsApp not connected',
-            status: connectionStatus
-        });
+        return res.status(503).json({ success: false, error: 'WhatsApp not connected' });
     }
     
     try {
@@ -292,7 +302,6 @@ app.post('/restart', async (req, res) => {
     }
     
     connectionStatus = 'idle';
-    isSocketReady = false;
     currentPairingCode = null;
     sock = null;
     
@@ -317,7 +326,6 @@ app.post('/logout', async (req, res) => {
     } catch(e) {}
     
     connectionStatus = 'idle';
-    isSocketReady = false;
     currentPairingCode = null;
     sock = null;
     
