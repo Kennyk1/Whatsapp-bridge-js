@@ -1,5 +1,4 @@
 // bailey_bridge.js - WhatsApp Bridge Service for TeleAgent
-// Deployed on Render as a standalone Node.js Web Service
 
 const { default: makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion } = require('@whiskeysockets/baileys');
 const express = require('express');
@@ -13,14 +12,6 @@ const PORT = process.env.PORT || 10000;
 const SESSION_ID = process.env.SESSION_ID || 'default';
 const ADMIN_SECRET = process.env.ADMIN_SECRET || 'change-this-secret';
 const FLASK_APP_URL = process.env.FLASK_APP_URL;
-const USE_SUPABASE = process.env.SUPABASE_URL && process.env.SUPABASE_KEY;
-
-let supabase = null;
-if (USE_SUPABASE) {
-    const { createClient } = require('@supabase/supabase-js');
-    supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
-    console.log('✅ Supabase configured for session backup');
-}
 
 // ============================================================
 // AUTH STATE STORAGE
@@ -35,29 +26,14 @@ if (!fs.existsSync(AUTH_DIR)) {
 // GLOBAL STATE
 // ============================================================
 let sock = null;
-let connectionStatus = 'disconnected';
+let connectionStatus = 'idle'; // idle, connecting, pairing_pending, connected
 let isSocketReady = false;
 let currentPairingCode = null;
-let lastError = null;
+let connectionPromise = null;
 
 // ============================================================
 // HELPER FUNCTIONS
 // ============================================================
-
-async function backupSessionToSupabase(sessionData) {
-    if (!supabase) return;
-    try {
-        const { error } = await supabase
-            .from('teleagent_settings')
-            .upsert({
-                key: `wa_session_${SESSION_ID}`,
-                value: JSON.stringify(sessionData)
-            });
-        if (error) console.error('❌ Supabase backup failed:', error.message);
-    } catch (e) {
-        console.error('❌ Supabase backup error:', e.message);
-    }
-}
 
 async function notifyFlaskBackend(event) {
     if (!FLASK_APP_URL) return;
@@ -76,11 +52,16 @@ async function notifyFlaskBackend(event) {
 }
 
 // ============================================================
-// WHATSAPP CONNECTION
+// WHATSAPP CONNECTION (ONLY CALLED WHEN NEEDED)
 // ============================================================
 
-async function startWhatsApp() {
-    console.log('🔄 Starting WhatsApp connection...');
+async function initializeSocket() {
+    if (sock) {
+        console.log('⚠️ Socket already exists');
+        return sock;
+    }
+    
+    console.log('🔄 Initializing WhatsApp socket...');
     connectionStatus = 'connecting';
     isSocketReady = false;
     
@@ -94,31 +75,21 @@ async function startWhatsApp() {
             auth: state,
             printQRInTerminal: false,
             browser: ['TeleAgent', 'Chrome', '1.0.0'],
-            markOnlineOnConnect: true,
+            markOnlineOnConnect: false,
             syncFullHistory: false
         });
         
-        // Mark socket ready after a delay
+        // Mark socket ready after delay
         setTimeout(() => { 
             if (sock) {
                 isSocketReady = true;
-                console.log('✅ Socket marked ready');
+                console.log('✅ Socket ready for pairing');
             }
         }, 5000);
         
         sock.ev.on('creds.update', async () => {
             await saveCreds();
             console.log('🔐 Credentials saved');
-            if (supabase) {
-                try {
-                    const files = fs.readdirSync(AUTH_DIR);
-                    const sessionData = {};
-                    files.forEach(f => {
-                        sessionData[f] = fs.readFileSync(path.join(AUTH_DIR, f), 'utf8');
-                    });
-                    await backupSessionToSupabase(sessionData);
-                } catch (e) {}
-            }
         });
         
         sock.ev.on('connection.update', (update) => {
@@ -128,8 +99,7 @@ async function startWhatsApp() {
                 connectionStatus = 'connected';
                 isSocketReady = true;
                 currentPairingCode = null;
-                lastError = null;
-                console.log('✅ WhatsApp connected successfully!');
+                console.log('✅ WhatsApp connected!');
                 notifyFlaskBackend({ type: 'connected' });
             }
             
@@ -139,15 +109,13 @@ async function startWhatsApp() {
                 
                 connectionStatus = 'disconnected';
                 isSocketReady = false;
-                lastError = lastDisconnect?.error?.message || 'Connection closed';
                 
                 console.log(`🔌 Connection closed. Reason: ${statusCode}`);
                 
-                if (shouldReconnect) {
-                    console.log('⏳ Reconnecting in 5 seconds...');
-                    setTimeout(startWhatsApp, 5000);
-                } else {
+                // DO NOT AUTO-RECONNECT - wait for user to request pairing again
+                if (!shouldReconnect) {
                     console.log('❌ Logged out - needs new pairing');
+                    sock = null;
                 }
             }
         });
@@ -164,8 +132,6 @@ async function startWhatsApp() {
             else if (msgType === 'extendedTextMessage') msgText = message.message.extendedTextMessage.text;
             else if (msgType === 'imageMessage') msgText = message.message.imageMessage.caption || '[Image]';
             else if (msgType === 'videoMessage') msgText = message.message.videoMessage.caption || '[Video]';
-            else if (msgType === 'audioMessage') msgText = '[Voice Message]';
-            else if (msgType === 'documentMessage') msgText = '[Document]';
             else return;
             
             if (!msgText.trim()) return;
@@ -173,27 +139,26 @@ async function startWhatsApp() {
             const sender = message.key.remoteJid;
             const senderNumber = sender.split('@')[0];
             const senderName = message.pushName || 'Contact';
-            const isGroup = sender.endsWith('@g.us');
             
-            console.log(`📨 [${isGroup ? 'GROUP' : 'DM'}] ${senderName}: ${msgText.substring(0, 50)}...`);
+            console.log(`📨 WhatsApp from ${senderName}: ${msgText.substring(0, 50)}...`);
             
             await notifyFlaskBackend({
                 type: 'message',
                 sender_number: senderNumber,
                 sender_name: senderName,
                 message_text: msgText,
-                is_group: isGroup,
                 timestamp: new Date().toISOString()
             });
         });
         
         global.whatsappSocket = sock;
+        return sock;
         
     } catch (error) {
-        console.error('❌ Fatal error starting WhatsApp:', error);
-        connectionStatus = 'error';
-        lastError = error.message;
-        setTimeout(startWhatsApp, 10000);
+        console.error('❌ Fatal error:', error);
+        connectionStatus = 'idle';
+        sock = null;
+        throw error;
     }
 }
 
@@ -201,14 +166,13 @@ async function startWhatsApp() {
 // EXPRESS API SERVER
 // ============================================================
 const app = express();
-// CORS FIX
+
+// CORS
 app.use((req, res, next) => {
     res.header('Access-Control-Allow-Origin', '*');
     res.header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
     res.header('Access-Control-Allow-Headers', 'Content-Type, X-Internal-Secret');
-    if (req.method === 'OPTIONS') {
-        return res.sendStatus(200);
-    }
+    if (req.method === 'OPTIONS') return res.sendStatus(200);
     next();
 });
 
@@ -224,7 +188,7 @@ app.get('/', (req, res) => {
     });
 });
 
-// FIXED: Request pairing code
+// REQUEST PAIRING CODE - Initializes socket if needed
 app.post('/pair', async (req, res) => {
     const { phone_number } = req.body;
     
@@ -234,25 +198,37 @@ app.post('/pair', async (req, res) => {
     
     const cleanNumber = phone_number.replace(/\D/g, '');
     
-    if (!sock) {
-        return res.status(503).json({ success: false, error: 'WhatsApp not initialized. Try again in a few seconds.' });
-    }
-    
-    // Wait for socket to be ready (max 15 seconds)
-    let attempts = 0;
-    while (!isSocketReady && attempts < 15) {
-        await new Promise(r => setTimeout(r, 1000));
-        attempts++;
-    }
-    
-    if (!isSocketReady) {
-        return res.status(503).json({ success: false, error: 'Socket not ready. Please try again in 10 seconds.' });
-    }
-    
     try {
-        // Small additional delay for stability
-        await new Promise(r => setTimeout(r, 1000));
+        // Initialize socket if not exists or disconnected
+        if (!sock || connectionStatus === 'disconnected') {
+            await initializeSocket();
+        }
         
+        // Wait for socket to be ready
+        let attempts = 0;
+        while (!isSocketReady && attempts < 20) {
+            await new Promise(r => setTimeout(r, 1000));
+            attempts++;
+        }
+        
+        if (!isSocketReady) {
+            return res.status(503).json({ 
+                success: false, 
+                error: 'Socket not ready. Please try again in a few seconds.' 
+            });
+        }
+        
+        // Check if already connected
+        if (connectionStatus === 'connected') {
+            return res.json({ 
+                success: true, 
+                already_connected: true,
+                message: 'WhatsApp is already connected!'
+            });
+        }
+        
+        // Request pairing code
+        await new Promise(r => setTimeout(r, 1000));
         const code = await sock.requestPairingCode(cleanNumber);
         currentPairingCode = code;
         connectionStatus = 'pairing_pending';
@@ -271,18 +247,14 @@ app.post('/pair', async (req, res) => {
     } catch (error) {
         console.error('❌ Pairing error:', error.message);
         
-        if (error.message.includes('timeout') || error.message.includes('408')) {
-            return res.status(400).json({ 
+        if (error.message.includes('Connection Closed')) {
+            // Reset and retry
+            sock = null;
+            connectionStatus = 'idle';
+            isSocketReady = false;
+            return res.status(503).json({ 
                 success: false, 
-                error: 'Pairing request timed out. Please try again.',
-                fallback: 'qr'
-            });
-        }
-        
-        if (error.message.includes('already connected')) {
-            return res.status(400).json({ 
-                success: false, 
-                error: 'Already connected. Use /logout first to reconnect.' 
+                error: 'Connection lost. Please try again.' 
             });
         }
         
@@ -308,7 +280,7 @@ app.post('/send', async (req, res) => {
     
     const { to_number, text } = req.body;
     if (!to_number || !text) {
-        return res.status(400).json({ success: false, error: 'Missing to_number or text' });
+        return res.status(400).json({ success: false, error: 'Missing fields' });
     }
     
     if (!sock || connectionStatus !== 'connected') {
@@ -318,10 +290,8 @@ app.post('/send', async (req, res) => {
     try {
         const jid = `${to_number}@s.whatsapp.net`;
         await sock.sendMessage(jid, { text });
-        console.log(`📤 Sent reply to ${to_number}`);
         res.json({ success: true });
     } catch (e) {
-        console.error('❌ Send error:', e.message);
         res.status(500).json({ success: false, error: e.message });
     }
 });
@@ -332,7 +302,7 @@ app.post('/logout', async (req, res) => {
         return res.status(401).json({ success: false, error: 'Unauthorized' });
     }
     
-    console.log('🚪 Logout requested - clearing session');
+    console.log('🚪 Logout requested');
     if (sock) {
         try { await sock.logout(); sock.end(); } catch(e) {}
     }
@@ -340,20 +310,18 @@ app.post('/logout', async (req, res) => {
     try {
         fs.rmSync(AUTH_DIR, { recursive: true, force: true });
         fs.mkdirSync(AUTH_DIR, { recursive: true });
-        console.log('🗑️ Auth directory cleared');
     } catch(e) {}
     
-    connectionStatus = 'disconnected';
+    connectionStatus = 'idle';
     isSocketReady = false;
     currentPairingCode = null;
     sock = null;
     
-    setTimeout(startWhatsApp, 1000);
-    res.json({ success: true, message: 'Logged out. Restarting...' });
+    res.json({ success: true, message: 'Logged out' });
 });
 
 // ============================================================
-// START SERVER
+// START SERVER - DO NOT AUTO CONNECT
 // ============================================================
 app.listen(PORT, () => {
     console.log(`
@@ -361,17 +329,16 @@ app.listen(PORT, () => {
 ║         TELEAGENT WHATSAPP BRIDGE - READY               ║
 ╠══════════════════════════════════════════════════════════╣
 ║  Port: ${PORT}                                           
-║  Session ID: ${SESSION_ID}                              
+║  Status: IDLE (waiting for /pair request)               
 ║  Flask Backend: ${FLASK_APP_URL || 'NOT SET'}           
 ╠══════════════════════════════════════════════════════════╣
 ║  Endpoints:                                             ║
-║  GET  /         - Health check                          ║
 ║  POST /pair     - Request pairing code                  ║
 ║  GET  /status   - Connection status                     ║
 ║  POST /send     - Send WhatsApp message                 ║
-║  POST /logout   - Logout and clear session              ║
+║  POST /logout   - Logout                                ║
 ╚══════════════════════════════════════════════════════════╝
     `);
     
-    startWhatsApp();
+    //nice
 });
