@@ -1,0 +1,21 @@
+{
+  "name": "teleagent-whatsapp-bridge",
+  "version": "1.0.0",
+  "description": "WhatsApp bridge service for TeleAgent using Baileys",
+  "main": "bailey_bridge.js",
+  "scripts": {
+    "start": "node bailey_bridge.js",
+    "dev": "nodemon bailey_bridge.js"
+  },
+  "dependencies": {
+    "@whiskeysockets/baileys": "^6.7.0",
+    "express": "^4.18.2",
+    "@supabase/supabase-js": "^2.39.0"
+  },
+  "devDependencies": {
+    "nodemon": "^3.0.1"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
