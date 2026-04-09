@@ -12,10 +12,9 @@ const path = require('path');
 const PORT = process.env.PORT || 10000;
 const SESSION_ID = process.env.SESSION_ID || 'default';
 const ADMIN_SECRET = process.env.ADMIN_SECRET || 'change-this-secret';
-const FLASK_APP_URL = process.env.FLASK_APP_URL; // Required: Your Flask app URL
+const FLASK_APP_URL = process.env.FLASK_APP_URL;
 const USE_SUPABASE = process.env.SUPABASE_URL && process.env.SUPABASE_KEY;
 
-// Optional Supabase for session backup
 let supabase = null;
 if (USE_SUPABASE) {
     const { createClient } = require('@supabase/supabase-js');
@@ -24,7 +23,7 @@ if (USE_SUPABASE) {
 }
 
 // ============================================================
-// AUTH STATE STORAGE (Local filesystem)
+// AUTH STATE STORAGE
 // ============================================================
 const AUTH_DIR = path.join(__dirname, 'auth_state', SESSION_ID);
 if (!fs.existsSync(AUTH_DIR)) {
@@ -36,20 +35,16 @@ if (!fs.existsSync(AUTH_DIR)) {
 // GLOBAL STATE
 // ============================================================
 let sock = null;
-let connectionStatus = 'disconnected'; // 'disconnected', 'connecting', 'qr_pending', 'connected'
-let currentQR = null;
+let connectionStatus = 'disconnected';
+let currentPairingCode = null;
 let lastError = null;
 
 // ============================================================
 // HELPER FUNCTIONS
 // ============================================================
 
-/**
- * Save session to Supabase (optional backup)
- */
 async function backupSessionToSupabase(sessionData) {
     if (!supabase) return;
-    
     try {
         const { error } = await supabase
             .from('teleagent_settings')
@@ -64,17 +59,12 @@ async function backupSessionToSupabase(sessionData) {
     }
 }
 
-/**
- * Notify Flask backend about events (messages, status changes)
- */
 async function notifyFlaskBackend(event) {
     if (!FLASK_APP_URL) {
         console.warn('⚠️ FLASK_APP_URL not set - cannot notify backend');
         return;
     }
-    
     const webhookUrl = `${FLASK_APP_URL}/api/ta/whatsapp/webhook`;
-    
     try {
         const response = await fetch(webhookUrl, {
             method: 'POST',
@@ -87,7 +77,6 @@ async function notifyFlaskBackend(event) {
                 ...event
             })
         });
-        
         if (!response.ok) {
             console.error(`❌ Webhook failed: ${response.status}`);
         }
@@ -112,18 +101,16 @@ async function startWhatsApp() {
         sock = makeWASocket({
             version,
             auth: state,
-            printQRInTerminal: true,
+            printQRInTerminal: false,  // Disable QR, use pairing code instead
             browser: ['TeleAgent', 'Chrome', '1.0.0'],
             markOnlineOnConnect: true,
             syncFullHistory: false
         });
         
-        // ========== CREDENTIALS UPDATE ==========
+        // Credentials update
         sock.ev.on('creds.update', async () => {
             await saveCreds();
             console.log('🔐 Credentials updated and saved');
-            
-            // Backup to Supabase if configured
             if (supabase) {
                 try {
                     const files = fs.readdirSync(AUTH_DIR);
@@ -139,21 +126,13 @@ async function startWhatsApp() {
             }
         });
         
-        // ========== CONNECTION UPDATES ==========
-        sock.ev.on('connection.update', (update) => {
-            const { connection, lastDisconnect, qr } = update;
-            
-            if (qr) {
-                currentQR = qr;
-                connectionStatus = 'qr_pending';
-                console.log('\n📱 ========== SCAN QR CODE ==========');
-                console.log('QR Code received - scan with WhatsApp!');
-                notifyFlaskBackend({ type: 'qr_ready', qr: qr });
-            }
+        // Connection updates
+        sock.ev.on('connection.update', async (update) => {
+            const { connection, lastDisconnect } = update;
             
             if (connection === 'open') {
                 connectionStatus = 'connected';
-                currentQR = null;
+                currentPairingCode = null;
                 lastError = null;
                 console.log('✅ WhatsApp connected successfully!');
                 notifyFlaskBackend({ type: 'connected' });
@@ -179,20 +158,17 @@ async function startWhatsApp() {
                     console.log('⏳ Reconnecting in 5 seconds...');
                     setTimeout(startWhatsApp, 5000);
                 } else {
-                    console.log('❌ Logged out - manual QR scan required');
+                    console.log('❌ Logged out - needs new pairing');
                 }
             }
         });
         
-        // ========== INCOMING MESSAGES ==========
+        // Incoming messages
         sock.ev.on('messages.upsert', async (m) => {
             const message = m.messages[0];
-            
-            // Ignore if no message content or it's our own message
             if (!message.message) return;
             if (message.key.fromMe) return;
             
-            // Extract message text
             const msgType = Object.keys(message.message)[0];
             let msgText = '';
             
@@ -209,7 +185,7 @@ async function startWhatsApp() {
             } else if (msgType === 'documentMessage') {
                 msgText = '[Document]';
             } else {
-                return; // Ignore other message types
+                return;
             }
             
             if (!msgText.trim()) return;
@@ -221,7 +197,6 @@ async function startWhatsApp() {
             
             console.log(`📨 [${isGroup ? 'GROUP' : 'DM'}] ${senderName}: ${msgText.substring(0, 50)}...`);
             
-            // Forward to Flask backend
             await notifyFlaskBackend({
                 type: 'message',
                 sender_number: senderNumber,
@@ -232,15 +207,12 @@ async function startWhatsApp() {
             });
         });
         
-        // Store socket globally
         global.whatsappSocket = sock;
         
     } catch (error) {
         console.error('❌ Fatal error starting WhatsApp:', error);
         connectionStatus = 'error';
         lastError = error.message;
-        
-        // Retry after delay
         console.log('⏳ Retrying in 10 seconds...');
         setTimeout(startWhatsApp, 10000);
     }
@@ -252,7 +224,7 @@ async function startWhatsApp() {
 const app = express();
 app.use(express.json());
 
-// Health check endpoint (required for Render)
+// Health check
 app.get('/', (req, res) => {
     res.json({
         service: 'TeleAgent WhatsApp Bridge',
@@ -262,50 +234,69 @@ app.get('/', (req, res) => {
     });
 });
 
-// Get QR code for scanning
-app.get('/qr', (req, res) => {
-    if (currentQR) {
+// NEW: Request pairing code with phone number
+app.post('/pair', async (req, res) => {
+    const { phone_number } = req.body;
+    
+    if (!phone_number) {
+        return res.status(400).json({ success: false, error: 'Phone number required' });
+    }
+    
+    // Clean phone number (remove +, spaces, etc)
+    const cleanNumber = phone_number.replace(/\D/g, '');
+    
+    if (!sock) {
+        return res.status(503).json({ success: false, error: 'WhatsApp not initialized yet' });
+    }
+    
+    try {
+        // Wait a moment for socket to be ready
+        await new Promise(resolve => setTimeout(resolve, 2000));
+        
+        const code = await sock.requestPairingCode(cleanNumber);
+        currentPairingCode = code;
+        connectionStatus = 'pairing_pending';
+        
+        console.log(`🔑 Pairing code for ${cleanNumber}: ${code}`);
+        
         res.json({ 
             success: true, 
-            qr: currentQR,
-            status: 'qr_pending'
+            code: code,
+            message: 'Enter this code in WhatsApp: Settings → Linked Devices → Link a Device'
         });
-    } else if (connectionStatus === 'connected') {
-        res.json({ 
-            success: true, 
-            connected: true,
-            status: 'connected'
+        
+        // Notify Flask
+        notifyFlaskBackend({ 
+            type: 'pairing_code', 
+            phone: cleanNumber, 
+            code: code 
         });
-    } else {
-        res.json({ 
-            success: false, 
-            status: connectionStatus,
-            message: 'No QR available. Status: ' + connectionStatus
-        });
+        
+    } catch (error) {
+        console.error('❌ Pairing error:', error.message);
+        res.status(500).json({ success: false, error: error.message });
     }
 });
 
-// Get connection status
+// Get status
 app.get('/status', (req, res) => {
     res.json({ 
         success: true,
         status: connectionStatus,
         connected: connectionStatus === 'connected',
-        has_qr: currentQR !== null,
+        pairing_code: currentPairingCode,
         last_error: lastError
     });
 });
 
-// Send a message (called by Flask backend)
+// Send message
 app.post('/send', async (req, res) => {
     const secret = req.headers['x-internal-secret'];
-    
     if (secret !== ADMIN_SECRET) {
         return res.status(401).json({ success: false, error: 'Unauthorized' });
     }
     
     const { to_number, text } = req.body;
-    
     if (!to_number || !text) {
         return res.status(400).json({ success: false, error: 'Missing to_number or text' });
     }
@@ -329,63 +320,48 @@ app.post('/send', async (req, res) => {
     }
 });
 
-// Restart connection (admin only)
+// Restart
 app.post('/restart', async (req, res) => {
     const secret = req.headers['x-internal-secret'];
-    
     if (secret !== ADMIN_SECRET) {
         return res.status(401).json({ success: false, error: 'Unauthorized' });
     }
     
     console.log('🔄 Manual restart requested');
-    
     if (sock) {
-        try { 
-            sock.end(); 
-        } catch(e) {
-            console.error('Error ending socket:', e.message);
-        }
+        try { sock.end(); } catch(e) {}
     }
     
     connectionStatus = 'disconnected';
-    currentQR = null;
-    
-    // Start fresh connection
+    currentPairingCode = null;
     setTimeout(startWhatsApp, 1000);
     
     res.json({ success: true, message: 'Restarting WhatsApp connection' });
 });
 
-// Logout (clear session)
+// Logout
 app.post('/logout', async (req, res) => {
     const secret = req.headers['x-internal-secret'];
-    
     if (secret !== ADMIN_SECRET) {
         return res.status(401).json({ success: false, error: 'Unauthorized' });
     }
     
     console.log('🚪 Logout requested - clearing session');
-    
     if (sock) {
         try { 
             await sock.logout();
             sock.end();
-        } catch(e) {
-            console.error('Error during logout:', e.message);
-        }
+        } catch(e) {}
     }
     
-    // Clear auth directory
     try {
         fs.rmSync(AUTH_DIR, { recursive: true, force: true });
         fs.mkdirSync(AUTH_DIR, { recursive: true });
         console.log('🗑️ Auth directory cleared');
-    } catch(e) {
-        console.error('Error clearing auth dir:', e.message);
-    }
+    } catch(e) {}
     
     connectionStatus = 'disconnected';
-    currentQR = null;
+    currentPairingCode = null;
     sock = null;
     
     res.json({ success: true, message: 'Logged out and session cleared' });
@@ -406,7 +382,7 @@ app.listen(PORT, () => {
 ╠══════════════════════════════════════════════════════════╣
 ║  Endpoints:                                             ║
 ║  GET  /         - Health check                          ║
-║  GET  /qr       - Get QR code for scanning              ║
+║  POST /pair     - Request pairing code with phone       ║
 ║  GET  /status   - Get connection status                 ║
 ║  POST /send     - Send WhatsApp message                 ║
 ║  POST /restart  - Restart connection                    ║
@@ -414,6 +390,5 @@ app.listen(PORT, () => {
 ╚══════════════════════════════════════════════════════════╝
     `);
     
-    // Start WhatsApp connection
     startWhatsApp();
 });
