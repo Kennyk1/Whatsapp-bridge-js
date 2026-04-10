@@ -1,4 +1,10 @@
-const { default: makeWASocket, useMultiFileAuthState, fetchLatestBaileysVersion, DisconnectReason } = require('@whiskeysockets/baileys');
+const { 
+    default: makeWASocket, 
+    useMultiFileAuthState, 
+    fetchLatestBaileysVersion,
+    DisconnectReason,
+    Browsers
+} = require('@whiskeysockets/baileys');
 const express = require('express');
 const fs = require('fs');
 const path = require('path');
@@ -65,11 +71,15 @@ async function startSocket() {
     const { version } = await fetchLatestBaileysVersion();
 
     sock = makeWASocket({
-        version,
-        auth: state,
-        printQRInTerminal: false,
-        browser: ['TeleAgent', 'Chrome', '1.0.0']
-    });
+    version,
+    auth: state,
+    printQRInTerminal: false,
+    browser: Browsers.appropriate('Chrome'),  // change this
+    syncFullHistory: false,
+    markOnlineOnConnect: false,
+    defaultQueryTimeoutMs: 60000,
+    keepAliveIntervalMs: 45000,
+});
 
     sock.ev.on('creds.update', async () => {
         await saveCreds();
