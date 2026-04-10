@@ -8,6 +8,7 @@ const {
 const express = require('express');
 const fs = require('fs');
 const path = require('path');
+const pino = require('pino');
 
 const PORT = process.env.PORT || 10000;
 const SESSION_ID = process.env.SESSION_ID || 'default';
@@ -73,8 +74,9 @@ async function startSocket() {
     sock = makeWASocket({
     version,
     auth: state,
+    logger: pino({ level: 'silent' }),
     printQRInTerminal: false,
-    browser: Browsers.appropriate('Chrome'),  // change this
+    browser: Browsers.appropriate('Chrome'),
     syncFullHistory: false,
     markOnlineOnConnect: false,
     defaultQueryTimeoutMs: 60000,
