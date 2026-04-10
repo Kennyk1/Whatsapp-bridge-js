@@ -1,14 +1,7 @@
-const { 
-    default: makeWASocket, 
-    useMultiFileAuthState, 
-    fetchLatestBaileysVersion,
-    DisconnectReason,
-    Browsers
-} = require('@whiskeysockets/baileys');
+const { default: makeWASocket, useMultiFileAuthState, fetchLatestBaileysVersion, DisconnectReason, Browsers } = require('@whiskeysockets/baileys');
 const express = require('express');
 const fs = require('fs');
 const path = require('path');
-const pino = require('pino');
 
 const PORT = process.env.PORT || 10000;
 const SESSION_ID = process.env.SESSION_ID || 'default';
@@ -30,6 +23,7 @@ let connectionStatus = 'idle';
 let currentPairingCode = null;
 let lastError = null;
 let pendingPairResolve = null;
+let waOwnerNumber = null;
 
 function clearSession() {
     try {
@@ -62,7 +56,7 @@ async function notifyFlask(event) {
                 'Content-Type': 'application/json',
                 'X-Internal-Secret': ADMIN_SECRET
             },
-            body: JSON.stringify({ session_id: SESSION_ID, ...event })
+            body: JSON.stringify({ wa_owner_number: waOwnerNumber, ...event })
         });
     } catch (e) {}
 }
@@ -72,16 +66,15 @@ async function startSocket() {
     const { version } = await fetchLatestBaileysVersion();
 
     sock = makeWASocket({
-    version,
-    auth: state,
-    logger: pino({ level: 'silent' }),
-    printQRInTerminal: false,
-    browser: Browsers.appropriate('Chrome'),
-    syncFullHistory: false,
-    markOnlineOnConnect: false,
-    defaultQueryTimeoutMs: 60000,
-    keepAliveIntervalMs: 45000,
-});
+        version,
+        auth: state,
+        printQRInTerminal: false,
+        browser: Browsers.appropriate('Chrome'),
+        syncFullHistory: false,
+        markOnlineOnConnect: false,
+        defaultQueryTimeoutMs: 60000,
+        keepAliveIntervalMs: 45000,
+    });
 
     sock.ev.on('creds.update', async () => {
         await saveCreds();
@@ -106,6 +99,7 @@ async function startSocket() {
         }
 
         if (connection === 'open') {
+            waOwnerNumber = sock.user?.id?.split(':')[0]?.split('@')[0] || null;
             connectionStatus = 'connected';
             currentPairingCode = null;
             lastError = null;
