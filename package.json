@@ -6,10 +6,10 @@
     "start": "node bailey_bridge.js"
   },
   "dependencies": {
-    "@whiskeysockets/baileys": "6.7.16",
+    "@whiskeysockets/baileys": "7.0.0-rc.9",
     "express": "^4.18.2",
     "@supabase/supabase-js": "^2.39.0",
-    "pino": "^8.0.0",
+    pino": "^10.1.0",
     "qrcode": "^1.5.3"
   },
   "engines": {
