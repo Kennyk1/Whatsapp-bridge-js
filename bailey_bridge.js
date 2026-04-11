@@ -306,24 +306,38 @@ app.post('/send', async (req, res) => {
     
     const secret = req.headers['x-internal-secret'];
     if (secret !== ADMIN_SECRET) {
-        console.log('❌ /send unauthorized');
         return res.status(401).json({ success: false, error: 'Unauthorized' });
     }
     
     const { from_number, to_number, text } = req.body;
     console.log(`📤 Sending from ${from_number} to ${to_number}: ${text?.substring(0, 30)}`);
     
-    const sock = sockets[from_number];
+    let sock = sockets[from_number];
+    
+    // ✅ If socket missing but we have credentials, restore it
+    if (!sock) {
+        console.log(`⚠️ No socket for ${from_number}, attempting to restore...`);
+        
+        const authDir = getAuthDir(from_number);
+        if (fs.existsSync(path.join(authDir, 'creds.json'))) {
+            try {
+                await startSocketForPhone(from_number);
+                sock = sockets[from_number];
+                console.log(`✅ Restored socket for ${from_number}`);
+            } catch (e) {
+                console.error(`❌ Failed to restore socket: ${e.message}`);
+            }
+        }
+    }
+    
     if (!sock) {
         console.log(`❌ No socket for ${from_number}. Available: ${Object.keys(sockets)}`);
         return res.status(503).json({ success: false, error: 'WhatsApp not connected for this number' });
     }
     
-    console.log(`📤 Socket found for ${from_number}, sending...`);
-    
     try {
         const jid = `${to_number}@s.whatsapp.net`;
-        const result = await sock.sendMessage(jid, { text });
+        await sock.sendMessage(jid, { text });
         console.log(`✅ Message sent to ${to_number}`);
         res.json({ success: true });
     } catch (e) {
