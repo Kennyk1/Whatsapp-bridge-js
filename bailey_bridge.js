@@ -165,10 +165,29 @@ async function startSocketForPhone(phone) {
             message_text: msgText,
             is_group: isGroup,
             timestamp: new Date().toISOString()
-        }, phone);  // ✅ Include the owner phone number
+        }, phone);
     });
 
     return sock;
+}
+
+// ✅ Restore a single socket from disk (used by /send when socket missing)
+async function restoreSocketForPhone(phone) {
+    const authDir = getAuthDir(phone);
+    if (!fs.existsSync(path.join(authDir, 'creds.json'))) {
+        console.log(`❌ No credentials found for ${phone}`);
+        return null;
+    }
+    
+    try {
+        console.log(`🔄 Restoring socket for ${phone}...`);
+        const sock = await startSocketForPhone(phone);
+        console.log(`✅ Socket restored for ${phone}`);
+        return sock;
+    } catch (e) {
+        console.error(`❌ Failed to restore socket for ${phone}:`, e.message);
+        return null;
+    }
 }
 
 // ✅ Restore all previously connected sessions on startup
@@ -184,9 +203,7 @@ async function restoreAllSessions() {
             const phone = row.key.replace('wa_session_', '');
             const authDir = getAuthDir(phone);
             
-            // Check if we have local creds or need to pull from Supabase
             if (!fs.existsSync(path.join(authDir, 'creds.json'))) {
-                // Pull from Supabase
                 const { data: sessionData } = await supabase.from('teleagent_settings')
                     .select('value')
                     .eq('key', `wa_session_${phone}`)
@@ -200,7 +217,6 @@ async function restoreAllSessions() {
                 }
             }
             
-            // Start the socket
             console.log(`🔄 Restoring session for: ${phone}`);
             startSocketForPhone(phone).catch(e => console.error(`Failed to restore ${phone}:`, e));
         }
@@ -233,19 +249,16 @@ app.get('/', (req, res) => {
     });
 });
 
-// ✅ Pair endpoint - now phone-specific
 app.post('/pair', async (req, res) => {
     const { phone_number } = req.body;
     if (!phone_number) return res.status(400).json({ success: false, error: 'Phone number required' });
 
     const cleanNumber = phone_number.replace(/\D/g, '');
 
-    // Check if already connected
     if (sockets[cleanNumber] && socketStatus[cleanNumber] === 'connected') {
         return res.json({ success: true, already_connected: true, message: 'Already connected!' });
     }
 
-    // Kill existing socket for this phone if any (force fresh start)
     if (sockets[cleanNumber]) {
         try { sockets[cleanNumber].end(); } catch {}
         delete sockets[cleanNumber];
@@ -277,7 +290,6 @@ app.post('/pair', async (req, res) => {
     }
 });
 
-// ✅ Status endpoint - returns status for a specific phone
 app.get('/status', (req, res) => {
     const phone = req.query.phone;
     
@@ -300,7 +312,7 @@ app.get('/status', (req, res) => {
     });
 });
 
-// ✅ Send endpoint - now phone-specific
+// ✅ Send endpoint - with auto-restore
 app.post('/send', async (req, res) => {
     console.log('📤 /send received:', req.body);
     
@@ -310,24 +322,18 @@ app.post('/send', async (req, res) => {
     }
     
     const { from_number, to_number, text } = req.body;
-    console.log(`📤 Sending from ${from_number} to ${to_number}: ${text?.substring(0, 30)}`);
+    if (!from_number || !to_number || !text) {
+        return res.status(400).json({ success: false, error: 'Missing from_number, to_number, or text' });
+    }
+    
+    console.log(`📤 Sending from ${from_number} to ${to_number}: ${text.substring(0, 30)}`);
     
     let sock = sockets[from_number];
     
-    // ✅ If socket missing but we have credentials, restore it
+    // ✅ If socket missing, restore it
     if (!sock) {
         console.log(`⚠️ No socket for ${from_number}, attempting to restore...`);
-        
-        const authDir = getAuthDir(from_number);
-        if (fs.existsSync(path.join(authDir, 'creds.json'))) {
-            try {
-                await startSocketForPhone(from_number);
-                sock = sockets[from_number];
-                console.log(`✅ Restored socket for ${from_number}`);
-            } catch (e) {
-                console.error(`❌ Failed to restore socket: ${e.message}`);
-            }
-        }
+        sock = await restoreSocketForPhone(from_number);
     }
     
     if (!sock) {
@@ -346,7 +352,6 @@ app.post('/send', async (req, res) => {
     }
 });
 
-// ✅ Logout endpoint - phone-specific
 app.post('/logout', async (req, res) => {
     if (req.headers['x-internal-secret'] !== ADMIN_SECRET)
         return res.status(401).json({ success: false, error: 'Unauthorized' });
@@ -368,7 +373,6 @@ app.post('/logout', async (req, res) => {
     res.json({ success: true, message: `Logged out ${cleanNumber}` });
 });
 
-// ✅ Restart endpoint - phone-specific
 app.post('/restart', async (req, res) => {
     if (req.headers['x-internal-secret'] !== ADMIN_SECRET)
         return res.status(401).json({ success: false, error: 'Unauthorized' });
@@ -384,8 +388,6 @@ app.post('/restart', async (req, res) => {
     }
     
     socketStatus[cleanNumber] = 'idle';
-    
-    // Restart
     startSocketForPhone(cleanNumber).catch(console.error);
 
     res.json({ success: true, message: `Restarted ${cleanNumber}` });
@@ -403,14 +405,13 @@ app.listen(PORT, async () => {
 ║  Flask Backend: ${FLASK_APP_URL || 'NOT SET'}           
 ╠══════════════════════════════════════════════════════════╣
 ║  Endpoints:                                             ║
-║  POST /pair?phone=xxx    - Request pairing code         ║
-║  GET  /status?phone=xxx  - Connection status            ║
-║  POST /send              - Send WhatsApp message        ║
-║  POST /logout?phone=xxx  - Logout specific number       ║
-║  POST /restart?phone=xxx - Restart specific number      ║
+║  POST /pair             - Request pairing code          ║
+║  GET  /status           - Connection status             ║
+║  POST /send             - Send WhatsApp message         ║
+║  POST /logout           - Logout specific number        ║
+║  POST /restart          - Restart specific number       ║
 ╚══════════════════════════════════════════════════════════╝
     `);
     
-    // Restore all previous sessions
     await restoreAllSessions();
 });
