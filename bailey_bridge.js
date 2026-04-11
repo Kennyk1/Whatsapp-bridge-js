@@ -174,18 +174,46 @@ async function startSocketForPhone(phone) {
 // ✅ Restore a single socket from disk (used by /send when socket missing)
 async function restoreSocketForPhone(phone) {
     const authDir = getAuthDir(phone);
+    
+    // ✅ If no local creds, try to pull from Supabase
     if (!fs.existsSync(path.join(authDir, 'creds.json'))) {
-        console.log(`❌ No credentials found for ${phone}`);
-        return null;
+        console.log(`📦 No local creds for ${phone}, checking Supabase...`);
+        
+        if (supabase) {
+            try {
+                const { data: sessionData } = await supabase.from('teleagent_settings')
+                    .select('value')
+                    .eq('key', `wa_session_${phone}`)
+                    .single();
+                
+                if (sessionData?.value) {
+                    const files = JSON.parse(sessionData.value);
+                    for (const [filename, content] of Object.entries(files)) {
+                        fs.writeFileSync(path.join(authDir, filename), content);
+                    }
+                    console.log(`✅ Restored creds from Supabase for ${phone}`);
+                } else {
+                    console.log(`❌ No Supabase backup for ${phone}`);
+                    return null;
+                }
+            } catch (e) {
+                console.error(`❌ Supabase pull failed:`, e.message);
+                return null;
+            }
+        } else {
+            console.log(`❌ Supabase not configured`);
+            return null;
+        }
     }
     
+    // Now start the socket
     try {
-        console.log(`🔄 Restoring socket for ${phone}...`);
+        console.log(`🔄 Starting socket for ${phone}...`);
         const sock = await startSocketForPhone(phone);
         console.log(`✅ Socket restored for ${phone}`);
         return sock;
     } catch (e) {
-        console.error(`❌ Failed to restore socket for ${phone}:`, e.message);
+        console.error(`❌ Failed to start socket for ${phone}:`, e.message);
         return null;
     }
 }
