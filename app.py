@@ -5,10 +5,10 @@ import os
 import logging
 import asyncio
 
-# Import everything from sms.py
+
 from sms import (
     start, button_handler, handle_text_message,
-    ivas_login, login_done, refill_numbers_if_needed,
+    ivas_login, login_done, ivas_logged_in, refill_numbers_if_needed,
     poll_otps_sync, log
 )
 
