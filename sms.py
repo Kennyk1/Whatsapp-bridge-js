@@ -46,6 +46,7 @@ supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 # ── iVAS Session ──────────────────────────────────────────────────────────────
 ivas_session   = req.Session()
 ivas_logged_in = False
+login_done = threading.Event()  # Track when login completes
 
 def solve_turnstile():
     """Solve Cloudflare Turnstile via CapMonster."""
@@ -91,6 +92,7 @@ def ivas_login():
 
         token = solve_turnstile()
         if not token:
+            login_done.set()
             return False
 
         login = ivas_session.post(IVASMS_LOGIN_URL, data={
@@ -104,12 +106,15 @@ def ivas_login():
         if "login" not in login.url:
             ivas_logged_in = True
             log.info("✅ iVAS login successful")
+            login_done.set()
             return True
 
         log.error("iVAS login failed")
+        login_done.set()
         return False
     except Exception as e:
         log.error(f"ivas_login error: {e}")
+        login_done.set()
         return False
 
 def ensure_logged_in():
@@ -128,6 +133,32 @@ def ensure_logged_in():
         return ivas_login()
 
 # ── iVAS API calls ────────────────────────────────────────────────────────────
+
+def fetch_my_numbers_from_ivas():
+    """Fetch numbers already in 'My Numbers' from iVAS (not test pool)."""
+    if not ensure_logged_in():
+        return []
+    try:
+        r = ivas_session.get("https://www.ivasms.com/portal/numbers/my-numbers",
+                            headers={"User-Agent": "Mozilla/5.0"}, timeout=15)
+        from bs4 import BeautifulSoup
+        soup = BeautifulSoup(r.text, "html.parser")
+        
+        numbers = []
+        # Look for table with numbers
+        rows = soup.find_all("tr")
+        for row in rows:
+            cells = row.find_all("td")
+            if len(cells) >= 1:
+                text = row.get_text()
+                # Extract phone numbers (234 format)
+                phones = re.findall(r'234\d{10}', text)
+                for phone in phones:
+                    numbers.append({"phone_number": phone, "id": phone})
+        return numbers
+    except Exception as e:
+        log.error(f"fetch_my_numbers error: {e}")
+        return []
 
 def fetch_nigeria_numbers(page=0, search="NIGERIA"):
     """Fetch Nigeria numbers from test pool."""
@@ -170,12 +201,39 @@ def fetch_nigeria_numbers(page=0, search="NIGERIA"):
         log.error(f"fetch_nigeria_numbers error: {e}")
         return []
 
+def delete_number_from_ivas(termination_id):
+    """Delete a number from 'My Numbers' on iVAS."""
+    if not ensure_logged_in():
+        return False
+    try:
+        page = ivas_session.get("https://www.ivasms.com/portal/numbers/my-numbers",
+                                headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
+        from bs4 import BeautifulSoup
+        soup = BeautifulSoup(page.text, "html.parser")
+        csrf_input = soup.find("input", {"name": "_token"})
+        csrf = csrf_input["value"] if csrf_input else ""
+
+        r = ivas_session.post(
+            "https://www.ivasms.com/portal/numbers/termination/number/delete",
+            data={"_token": csrf, "id": str(termination_id)},
+            headers={
+                "Accept": "application/json, text/javascript, */*; q=0.01",
+                "X-Requested-With": "XMLHttpRequest",
+                "Referer": "https://www.ivasms.com/portal/numbers/my-numbers",
+                "Origin": "https://www.ivasms.com"
+            },
+            timeout=15
+        )
+        return True
+    except Exception as e:
+        log.error(f"delete_number error: {e}")
+        return False
+
 def add_number_to_my_numbers(termination_id):
     """Add a number from test pool to My Numbers."""
     if not ensure_logged_in():
         return False
     try:
-        # Get fresh CSRF
         page = ivas_session.get("https://www.ivasms.com/portal/numbers/test",
                                 headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
         from bs4 import BeautifulSoup
@@ -194,8 +252,13 @@ def add_number_to_my_numbers(termination_id):
             },
             timeout=15
         )
-        result = r.json()
-        return "done" in result.get("message", "").lower()
+        if r.text and r.text.strip():
+            try:
+                result = r.json()
+                return "done" in result.get("message", "").lower()
+            except:
+                return False
+        return False
     except Exception as e:
         log.error(f"add_number error: {e}")
         return False
@@ -207,7 +270,6 @@ def fetch_otps_today():
     try:
         today = date.today().isoformat()
 
-        # Get CSRF from sms received page
         page = ivas_session.get("https://www.ivasms.com/portal/sms/received",
                                 headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
         from bs4 import BeautifulSoup
@@ -238,8 +300,6 @@ def parse_otps_from_html(html):
         from bs4 import BeautifulSoup
         soup = BeautifulSoup(html, "html.parser")
 
-        # Find all SMS entries - iVAS uses table rows or div structures
-        # Look for phone numbers (234...) and their messages
         rows = soup.find_all("tr")
         for row in rows:
             cells = row.find_all("td")
@@ -254,12 +314,10 @@ def parse_otps_from_html(html):
                         "timestamp": timestamp
                     })
 
-        # Also try div-based structure
         if not otps:
             sms_items = soup.find_all(class_=re.compile(r"sms|message|received", re.I))
             for item in sms_items:
                 text = item.get_text(strip=True)
-                # Extract phone numbers starting with 234
                 nums = re.findall(r'234\d{10,11}', text)
                 for n in nums:
                     otps.append({"number": n, "message": text, "timestamp": ""})
@@ -282,7 +340,6 @@ def db_upsert_user(user_id, username, first_name):
         log.error(f"db_upsert_user: {e}")
 
 def db_get_available_numbers(page=0):
-    """Get numbers not used and not assigned (or assignment expired)."""
     try:
         offset = page * NUMBERS_PER_PAGE
         r = (supabase.table("sms_numbers")
@@ -318,7 +375,6 @@ def db_assign_number(number_id, user_id):
         log.error(f"db_assign_number: {e}")
 
 def db_get_user_numbers(user_id):
-    """Get all numbers assigned to a user."""
     try:
         r = (supabase.table("sms_numbers")
              .select("*")
@@ -378,7 +434,6 @@ def db_add_number(termination_id, phone_number, range_name):
 
 def db_get_number_by_phone(phone_number):
     try:
-        # Normalize - strip leading + or spaces
         phone = phone_number.replace("+", "").replace(" ", "").strip()
         r = (supabase.table("sms_numbers")
              .select("*")
@@ -389,42 +444,64 @@ def db_get_number_by_phone(phone_number):
         log.error(f"db_get_number_by_phone: {e}")
         return None
 
-# ── Auto-refill numbers ───────────────────────────────────────────────────────
+def db_delete_all_numbers():
+    """Delete all numbers from database (for refresh cycle)."""
+    try:
+        supabase.table("sms_numbers").delete().neq("id", 0).execute()
+        log.info("All numbers deleted from database")
+    except Exception as e:
+        log.error(f"db_delete_all_numbers: {e}")
+
+# ── Smart Refill Numbers ───────────────────────────────────────────────────────
 
 def refill_numbers_if_needed():
-    """Check pool and refill from iVAS if running low."""
+    """Smart refill: Check if numbers are running low, if yes, delete old and add new batch."""
     try:
+        # Wait for login to complete
+        login_done.wait(timeout=30)
+        
+        if not ivas_logged_in:
+            log.error("Cannot refill - not logged in")
+            return
+            
         count = db_get_numbers_count()
         log.info(f"Number pool: {count} available")
-        if count < 50:
-            log.info("Refilling number pool from iVAS...")
+        
+        # If less than 100 numbers available, refresh entire pool
+        if count < 100:
+            log.info("Numbers running low. Refreshing entire pool...")
+            
+            # Delete all existing numbers from DB
+            db_delete_all_numbers()
+            
+            # Fetch new batch from iVAS test pool
             numbers = fetch_nigeria_numbers(page=0)
             added = 0
-            for n in numbers:
+            
+            for n in numbers[:1000]:  # Get up to 1000 numbers
                 phone = str(n.get("test_number", ""))
                 term_id = n.get("id")
                 range_name = n.get("range", "")
                 if not phone or not term_id:
                     continue
-                # Try adding to my numbers on iVAS
-                if add_number_to_my_numbers(term_id):
-                    if db_add_number(term_id, phone, range_name):
-                        added += 1
-                time.sleep(0.5)
-            log.info(f"Refilled {added} numbers")
+                
+                # Add to database without calling iVAS add API
+                if db_add_number(term_id, phone, range_name):
+                    added += 1
+                time.sleep(0.1)  # Small delay to avoid rate limiting
+            
+            log.info(f"Added {added} fresh numbers to database")
+            
     except Exception as e:
         log.error(f"refill_numbers_if_needed: {e}")
 
 # ── OTP Poller ────────────────────────────────────────────────────────────────
 
-# Global dict: phone_number -> list of user_ids waiting
-waiting_for_otp = {}  # {phone_number: [user_id, ...]}
-delivered_otps  = set()  # track already delivered OTP ids
+delivered_otps = set()
 
 async def notify_user_otp(app, user_id, phone_number, message):
     """Send OTP to user via Telegram."""
     try:
-        # Extract OTP code from message
         otp_codes = re.findall(r'\b\d{4,8}\b', message)
         otp_display = " | ".join(otp_codes) if otp_codes else "See full message"
 
@@ -469,7 +546,6 @@ def poll_otps_sync(app):
                     if otp_key in delivered_otps:
                         continue
 
-                    # Check if any user is waiting for this number
                     row = db_get_number_by_phone(phone)
                     if row and row.get("assigned_to") and not row.get("otp_delivered"):
                         user_id = row["assigned_to"]
@@ -483,7 +559,7 @@ def poll_otps_sync(app):
 
         time.sleep(POLL_INTERVAL)
 
-# ── Keyboards ─────────────────────────────────────────────────────────────────
+# ── Keyboards (same as before) ────────────────────────────────────────────────
 
 def main_menu_keyboard():
     return InlineKeyboardMarkup([
@@ -499,14 +575,11 @@ def main_menu_keyboard():
 
 def numbers_keyboard(numbers, page, total_available):
     rows = []
-
-    # Number buttons - each number is a button
     for i, num in enumerate(numbers):
         phone = num["phone_number"]
         display = f"📞 +{phone}"
         rows.append([InlineKeyboardButton(display, callback_data=f"assign_{num['id']}")])
 
-    # Navigation row
     nav = []
     if page > 0:
         nav.append(InlineKeyboardButton("⬅️ Prev", callback_data=f"get_numbers_{page-1}"))
@@ -571,15 +644,12 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
 
 async def handle_text_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Handle when user sends a phone number directly."""
     user = update.effective_user
     text = update.message.text.strip()
 
-    # Check if it looks like a phone number
     phone_clean = re.sub(r'[\s\+\-\(\)]', '', text)
 
     if re.match(r'^(234|0)\d{10}$', phone_clean):
-        # Normalize to 234 format
         if phone_clean.startswith("0"):
             phone_clean = "234" + phone_clean[1:]
 
@@ -606,7 +676,6 @@ async def handle_text_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-        # Assign to this user and start watching
         db_assign_number(row["id"], user.id)
 
         await update.message.reply_text(
@@ -634,100 +703,55 @@ async def button_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     data = query.data
 
-    # ── Main Menu ──
     if data == "main_menu":
-        caption = (
-            f"🏠 *Main Menu*\n\n"
-            f"Welcome back, {user.first_name}! Choose an option:"
-        )
+        caption = f"🏠 *Main Menu*\n\nWelcome back, {user.first_name}! Choose an option:"
         try:
-            await query.edit_message_caption(
-                caption=caption,
-                parse_mode=ParseMode.MARKDOWN,
-                reply_markup=main_menu_keyboard()
-            )
+            await query.edit_message_caption(caption=caption, parse_mode=ParseMode.MARKDOWN, reply_markup=main_menu_keyboard())
         except:
-            await query.edit_message_text(
-                caption,
-                parse_mode=ParseMode.MARKDOWN,
-                reply_markup=main_menu_keyboard()
-            )
+            await query.edit_message_text(caption, parse_mode=ParseMode.MARKDOWN, reply_markup=main_menu_keyboard())
 
-    # ── Get Numbers ──
     elif data.startswith("get_numbers_"):
         page = int(data.split("_")[-1])
         numbers = db_get_available_numbers(page=page)
-        total   = db_get_numbers_count()
+        total = db_get_numbers_count()
 
         if not numbers:
             if page == 0:
-                # Try to refill
-                msg_text = (
-                    "⏳ *Loading numbers...*\n\n"
-                    "Fetching fresh Nigeria numbers from our pool.\n"
-                    "Please wait a moment!"
-                )
+                msg_text = "⏳ *Loading numbers...*\n\nFetching fresh Nigeria numbers from our pool.\nPlease wait a moment!"
                 try:
                     await query.edit_message_caption(caption=msg_text, parse_mode=ParseMode.MARKDOWN)
                 except:
                     await query.edit_message_text(msg_text, parse_mode=ParseMode.MARKDOWN)
 
-                # Run refill in thread
                 threading.Thread(target=refill_numbers_if_needed, daemon=True).start()
                 time.sleep(3)
                 numbers = db_get_available_numbers(page=0)
-                total   = db_get_numbers_count()
+                total = db_get_numbers_count()
 
             if not numbers:
-                err_text = (
-                    "😔 *No numbers available right now*\n\n"
-                    "Our team is adding more numbers.\n"
-                    "Please try again in a few minutes!"
-                )
+                err_text = "😔 *No numbers available right now*\n\nOur team is adding more numbers.\nPlease try again in a few minutes!"
                 try:
-                    await query.edit_message_caption(
-                        caption=err_text,
-                        parse_mode=ParseMode.MARKDOWN,
-                        reply_markup=InlineKeyboardMarkup([[
-                            InlineKeyboardButton("🔄 Retry", callback_data="get_numbers_0"),
-                            InlineKeyboardButton("🏠 Menu", callback_data="main_menu")
-                        ]])
-                    )
+                    await query.edit_message_caption(caption=err_text, parse_mode=ParseMode.MARKDOWN, reply_markup=InlineKeyboardMarkup([[
+                        InlineKeyboardButton("🔄 Retry", callback_data="get_numbers_0"),
+                        InlineKeyboardButton("🏠 Menu", callback_data="main_menu")
+                    ]]))
                 except:
-                    await query.edit_message_text(
-                        err_text,
-                        parse_mode=ParseMode.MARKDOWN,
-                        reply_markup=InlineKeyboardMarkup([[
-                            InlineKeyboardButton("🔄 Retry", callback_data="get_numbers_0"),
-                            InlineKeyboardButton("🏠 Menu", callback_data="main_menu")
-                        ]])
-                    )
+                    await query.edit_message_text(err_text, parse_mode=ParseMode.MARKDOWN, reply_markup=InlineKeyboardMarkup([[
+                        InlineKeyboardButton("🔄 Retry", callback_data="get_numbers_0"),
+                        InlineKeyboardButton("🏠 Menu", callback_data="main_menu")
+                    ]]))
                 return
 
         start_num = page * NUMBERS_PER_PAGE + 1
-        end_num   = start_num + len(numbers) - 1
+        end_num = start_num + len(numbers) - 1
 
-        text = (
-            f"📱 *Available Nigeria Numbers*\n\n"
-            f"Showing #{start_num}–#{end_num} of {total} available\n\n"
-            f"👇 *Tap any number to assign it to yourself*\n"
-            f"Once assigned, I'll watch for your OTP automatically!"
-        )
+        text = f"📱 *Available Nigeria Numbers*\n\nShowing #{start_num}–#{end_num} of {total} available\n\n👇 *Tap any number to assign it to yourself*\nOnce assigned, I'll watch for your OTP automatically!"
 
         try:
-            await query.edit_message_caption(
-                caption=text,
-                parse_mode=ParseMode.MARKDOWN,
-                reply_markup=numbers_keyboard(numbers, page, total)
-            )
+            await query.edit_message_caption(caption=text, parse_mode=ParseMode.MARKDOWN, reply_markup=numbers_keyboard(numbers, page, total))
         except:
-            await query.edit_message_text(
-                text,
-                parse_mode=ParseMode.MARKDOWN,
-                reply_markup=numbers_keyboard(numbers, page, total)
-            )
+            await query.edit_message_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=numbers_keyboard(numbers, page, total))
 
-    # ── Assign Number ──
     elif data.startswith("assign_"):
         number_id = int(data.split("_")[1])
         try:
@@ -739,62 +763,33 @@ async def button_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             num = r.data[0]
             if num.get("assigned_to") and num["assigned_to"] != user.id:
                 await query.answer("⚡ Just taken! Showing you another...", show_alert=False)
-                # Show next available
-                ctx.user_data["page"] = ctx.user_data.get("page", 0)
                 return
 
-            # Assign exclusively
             db_assign_number(number_id, user.id)
 
             phone = num["phone_number"]
-            text = (
-                f"✅ *Number Assigned to You!*\n\n"
-                f"📱 *Your Number:* `+{phone}`\n"
-                f"🌍 *Range:* {num.get('range_name', 'Nigeria')}\n\n"
-                f"*What to do next:*\n"
-                f"1️⃣ Use this number on the website/app\n"
-                f"2️⃣ Request the OTP\n"
-                f"3️⃣ I'll auto-send it here when it arrives! 🚀\n\n"
-                f"⏰ *Monitoring:* Active ✅\n"
-                f"🔄 *Poll interval:* Every {POLL_INTERVAL}s"
-            )
+            text = f"✅ *Number Assigned to You!*\n\n📱 *Your Number:* `+{phone}`\n🌍 *Range:* {num.get('range_name', 'Nigeria')}\n\n*What to do next:*\n1️⃣ Use this number on the website/app\n2️⃣ Request the OTP\n3️⃣ I'll auto-send it here when it arrives! 🚀\n\n⏰ *Monitoring:* Active ✅\n🔄 *Poll interval:* Every {POLL_INTERVAL}s"
 
             keyboard = InlineKeyboardMarkup([
                 [InlineKeyboardButton(f"🔍 Check OTP for +{phone}", callback_data=f"check_single_{phone}")],
-                [
-                    InlineKeyboardButton("📋 My Numbers", callback_data="my_numbers"),
-                    InlineKeyboardButton("📱 Get More", callback_data="get_numbers_0")
-                ],
+                [InlineKeyboardButton("📋 My Numbers", callback_data="my_numbers"), InlineKeyboardButton("📱 Get More", callback_data="get_numbers_0")],
                 [InlineKeyboardButton("🏠 Menu", callback_data="main_menu")]
             ])
 
             try:
-                await query.edit_message_caption(
-                    caption=text,
-                    parse_mode=ParseMode.MARKDOWN,
-                    reply_markup=keyboard
-                )
+                await query.edit_message_caption(caption=text, parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard)
             except:
-                await query.edit_message_text(
-                    text,
-                    parse_mode=ParseMode.MARKDOWN,
-                    reply_markup=keyboard
-                )
+                await query.edit_message_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard)
 
         except Exception as e:
             log.error(f"assign error: {e}")
             await query.answer("❌ Error assigning number", show_alert=True)
 
-    # ── My Numbers ──
     elif data == "my_numbers":
         numbers = db_get_user_numbers(user.id)
 
         if not numbers:
-            text = (
-                f"📋 *Your Numbers*\n\n"
-                f"You don't have any active numbers yet.\n\n"
-                f"Tap *Get Numbers* to grab some!"
-            )
+            text = "📋 *Your Numbers*\n\nYou don't have any active numbers yet.\n\nTap *Get Numbers* to grab some!"
             keyboard = InlineKeyboardMarkup([[
                 InlineKeyboardButton("📱 Get Numbers", callback_data="get_numbers_0"),
                 InlineKeyboardButton("🏠 Menu", callback_data="main_menu")
@@ -803,31 +798,15 @@ async def button_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             lines = []
             for num in numbers:
                 phone = num["phone_number"]
-                status = "⏳ Waiting for OTP"
-                lines.append(f"📞 `+{phone}` — {status}")
-
-            text = (
-                f"📋 *Your Active Numbers*\n\n"
-                + "\n".join(lines) +
-                f"\n\n🔍 Tap a number below to check OTP manually\n"
-                f"⚡ Auto-delivery is always running!"
-            )
+                lines.append(f"📞 `+{phone}` — ⏳ Waiting for OTP")
+            text = f"📋 *Your Active Numbers*\n\n" + "\n".join(lines) + f"\n\n🔍 Tap a number below to check OTP manually\n⚡ Auto-delivery is always running!"
             keyboard = my_numbers_keyboard(numbers)
 
         try:
-            await query.edit_message_caption(
-                caption=text,
-                parse_mode=ParseMode.MARKDOWN,
-                reply_markup=keyboard
-            )
+            await query.edit_message_caption(caption=text, parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard)
         except:
-            await query.edit_message_text(
-                text,
-                parse_mode=ParseMode.MARKDOWN,
-                reply_markup=keyboard
-            )
+            await query.edit_message_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard)
 
-    # ── Check OTP (all user numbers) ──
     elif data == "check_otp":
         numbers = db_get_user_numbers(user.id)
         if not numbers:
@@ -853,32 +832,17 @@ async def button_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                             found_any = True
 
         if not found_any:
-            text = (
-                f"🔍 *OTP Check Complete*\n\n"
-                f"No new OTPs found for your numbers yet.\n\n"
-                f"📱 *Your numbers:*\n"
-                + "\n".join([f"• `+{n['phone_number']}`" for n in numbers]) +
-                f"\n\n⏳ I'm auto-monitoring every {POLL_INTERVAL}s.\nYou'll be notified instantly!"
-            )
+            text = f"🔍 *OTP Check Complete*\n\nNo new OTPs found for your numbers yet.\n\n📱 *Your numbers:*\n" + "\n".join([f"• `+{n['phone_number']}`" for n in numbers]) + f"\n\n⏳ I'm auto-monitoring every {POLL_INTERVAL}s.\nYou'll be notified instantly!"
             keyboard = InlineKeyboardMarkup([[
                 InlineKeyboardButton("🔄 Check Again", callback_data="check_otp"),
                 InlineKeyboardButton("📋 My Numbers", callback_data="my_numbers")
             ], [InlineKeyboardButton("🏠 Menu", callback_data="main_menu")]])
 
             try:
-                await query.edit_message_caption(
-                    caption=text,
-                    parse_mode=ParseMode.MARKDOWN,
-                    reply_markup=keyboard
-                )
+                await query.edit_message_caption(caption=text, parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard)
             except:
-                await query.edit_message_text(
-                    text,
-                    parse_mode=ParseMode.MARKDOWN,
-                    reply_markup=keyboard
-                )
+                await query.edit_message_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard)
 
-    # ── Check Single Number OTP ──
     elif data.startswith("check_single_"):
         phone = data.replace("check_single_", "")
         await query.answer("🔍 Checking...", show_alert=False)
@@ -901,94 +865,27 @@ async def button_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                         break
 
         if not found:
-            text = (
-                f"🔍 *No OTP yet for:*\n`+{phone}`\n\n"
-                f"⏳ Still monitoring... You'll be notified automatically!\n\n"
-                f"_Make sure you've used this number to request an OTP on the target site._"
-            )
+            text = f"🔍 *No OTP yet for:*\n`+{phone}`\n\n⏳ Still monitoring... You'll be notified automatically!\n\n_Make sure you've used this number to request an OTP on the target site._"
             keyboard = InlineKeyboardMarkup([[
                 InlineKeyboardButton("🔄 Check Again", callback_data=f"check_single_{phone}"),
                 InlineKeyboardButton("📋 My Numbers", callback_data="my_numbers")
             ], [InlineKeyboardButton("🏠 Menu", callback_data="main_menu")]])
 
             try:
-                await query.edit_message_caption(
-                    caption=text,
-                    parse_mode=ParseMode.MARKDOWN,
-                    reply_markup=keyboard
-                )
+                await query.edit_message_caption(caption=text, parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard)
             except:
-                await query.edit_message_text(
-                    text,
-                    parse_mode=ParseMode.MARKDOWN,
-                    reply_markup=keyboard
-                )
+                await query.edit_message_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard)
 
-    # ── How It Works ──
     elif data == "how_it_works":
-        text = (
-            f"ℹ️ *How This Bot Works*\n\n"
-            f"*Step 1 — Get a Number* 📱\n"
-            f"Tap Get Numbers to see real Nigerian phone numbers.\n\n"
-            f"*Step 2 — Use the Number* 🌐\n"
-            f"Enter the number on any website or app that asks for a Nigerian phone number.\n\n"
-            f"*Step 3 — Request OTP* 🔑\n"
-            f"Click 'Send OTP' or 'Verify' on that website.\n\n"
-            f"*Step 4 — Receive OTP Here* ✅\n"
-            f"The bot monitors 24/7 and sends you the OTP the moment it arrives!\n\n"
-            f"*Extra Tips:*\n"
-            f"• Send me any number directly to check it\n"
-            f"• Use *My Numbers* to see your assigned numbers\n"
-            f"• Numbers recycle after use for others\n\n"
-            f"💡 _Numbers are exclusively yours once assigned_"
-        )
+        text = "ℹ️ *How This Bot Works*\n\n*Step 1 — Get a Number* 📱\nTap Get Numbers to see real Nigerian phone numbers.\n\n*Step 2 — Use the Number* 🌐\nEnter the number on any website or app that asks for a Nigerian phone number.\n\n*Step 3 — Request OTP* 🔑\nClick 'Send OTP' or 'Verify' on that website.\n\n*Step 4 — Receive OTP Here* ✅\nThe bot monitors 24/7 and sends you the OTP the moment it arrives!\n\n*Extra Tips:*\n• Send me any number directly to check it\n• Use *My Numbers* to see your assigned numbers\n• Numbers recycle after use for others\n\n💡 _Numbers are exclusively yours once assigned_"
         keyboard = InlineKeyboardMarkup([[
             InlineKeyboardButton("📱 Get Numbers", callback_data="get_numbers_0"),
             InlineKeyboardButton("🏠 Menu", callback_data="main_menu")
         ]])
         try:
-            await query.edit_message_caption(
-                caption=text,
-                parse_mode=ParseMode.MARKDOWN,
-                reply_markup=keyboard
-            )
+            await query.edit_message_caption(caption=text, parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard)
         except:
-            await query.edit_message_text(
-                text,
-                parse_mode=ParseMode.MARKDOWN,
-                reply_markup=keyboard
-            )
+            await query.edit_message_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard)
 
     elif data == "noop":
         await query.answer()
-
-# ── Main ──────────────────────────────────────────────────────────────────────
-
-def main():
-    log.info("Starting SMS OTP Bot...")
-
-    # Initial login to iVAS
-    threading.Thread(target=ivas_login, daemon=True).start()
-
-    app = Application.builder().token(BOT_TOKEN).build()
-
-    # Handlers
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CallbackQueryHandler(button_handler))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_message))
-
-    # Start OTP polling in background
-    def start_poller():
-        time.sleep(10)  # Wait for login to complete
-        poll_otps_sync(app)
-
-    threading.Thread(target=start_poller, daemon=True).start()
-
-    # Start refill check
-    threading.Thread(target=refill_numbers_if_needed, daemon=True).start()
-
-    log.info("Bot is running! 🚀")
-    app.run_polling(drop_pending_updates=True)
-
-if __name__ == "__main__":
-    main()
