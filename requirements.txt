@@ -1,0 +1,4 @@
+supabase
+Flask
+beautifulsoup4
+python-telegram-bot
